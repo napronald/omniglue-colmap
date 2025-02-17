@@ -10,6 +10,8 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch import unbind
+import xformers.ops as xops
 
 
 class Mlp(nn.Module):
@@ -126,7 +128,7 @@ class PatchEmbed(nn.Module):
     return flops
 
 
-XFORMERS_AVAILABLE = False
+XFORMERS_AVAILABLE = True
 
 
 class Attention(nn.Module):
@@ -176,19 +178,19 @@ class MemEffAttention(Attention):
     if not XFORMERS_AVAILABLE:
       assert attn_bias is None, "xFormers is required for nested tensors usage"
       return super().forward(x)
-    else:
-      raise NotImplementedError("MemEffAttention do not support xFormer")
-    # B, N, C = x.shape
-    # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+    # else:
+      # raise NotImplementedError("MemEffAttention do not support xFormer")
+    B, N, C = x.shape
+    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
-    # q, k, v = unbind(qkv, 2)
+    q, k, v = unbind(qkv, 2)
 
-    # x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
-    # x = x.reshape([B, N, C])
+    x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+    x = x.reshape([B, N, C])
 
-    # x = self.proj(x)
-    # x = self.proj_drop(x)
-    # return x
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x
 
 
 class LayerScale(nn.Module):

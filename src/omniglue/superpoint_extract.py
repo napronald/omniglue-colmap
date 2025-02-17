@@ -1,214 +1,221 @@
-# Copyright 2024 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Adapted from https://github.com/google-research/omniglue/blob/main/src/omniglue/superpoint_extract.py
+# with added batch processing support, mask filtering, and omniglue input compatibility.
 
-"""Wrapper for performing SuperPoint inference."""
+import torch
+from torch import nn
 
-import math
-from typing import Optional, Tuple
+def simple_nms(scores, nms_radius: int):
+    """ Fast Non-maximum suppression to remove nearby points """
+    assert(nms_radius >= 0)
 
-import cv2
-import numpy as np
-from omniglue import utils
-import tensorflow.compat.v1 as tf1
+    def max_pool(x):
+        return torch.nn.functional.max_pool2d(
+            x, kernel_size=nms_radius*2+1, stride=1, padding=nms_radius)
+
+    zeros = torch.zeros_like(scores)
+    max_mask = scores == max_pool(scores)
+    for _ in range(2):
+        supp_mask = max_pool(max_mask.float()) > 0
+        supp_scores = torch.where(supp_mask, zeros, scores)
+        new_max_mask = supp_scores == max_pool(supp_scores)
+        max_mask = max_mask | (new_max_mask & (~supp_mask))
+    return torch.where(max_mask, scores, zeros)
 
 
-class SuperPointExtract:
-  """Class to initialize SuperPoint model and extract features from an image.
+def remove_borders(keypoints, scores, border: int, height: int, width: int):
+    """Removes keypoints too close to the border."""
+    mask_h = (keypoints[:, 0] >= border) & (keypoints[:, 0] < (height - border))
+    mask_w = (keypoints[:, 1] >= border) & (keypoints[:, 1] < (width - border))
+    mask = mask_h & mask_w
+    return keypoints[mask], scores[mask]
 
-  To stay consistent with SuperPoint training and eval configurations, resize
-  images to (320x240) or (640x480).
 
-  Attributes
-    model_path: string, filepath to saved SuperPoint TF1 model weights.
-  """
+def top_k_keypoints(keypoints, scores, k: int):
+    """Keeps only the top k keypoints based on score."""
+    if k >= len(keypoints):
+        return keypoints, scores
+    scores, indices = torch.topk(scores.squeeze(dim=1), k, dim=0)
+    return keypoints[indices], scores.unsqueeze(1)
 
-  def __init__(self, model_path: str):
-    self.model_path = model_path
-    self._graph = tf1.Graph()
-    self._sess = tf1.Session(graph=self._graph)
-    tf1.saved_model.loader.load(
-        self._sess, [tf1.saved_model.tag_constants.SERVING], model_path
+
+def sample_descriptors(keypoints, descriptors, s: int = 8):
+    """Interpolate descriptors at keypoint locations."""
+    b, c, h, w = descriptors.shape
+    # Convert from (x, y) to the normalized coordinates that grid_sample expects.
+    keypoints = keypoints - s / 2 + 0.5
+    keypoints /= torch.tensor([(w * s - s / 2 - 0.5), (h * s - s / 2 - 0.5)],
+                              ).to(keypoints)[None]
+    keypoints = keypoints * 2 - 1  # normalize to (-1, 1)
+
+    args = {'align_corners': True} if torch.__version__ >= '1.3' else {}
+    descriptors = torch.nn.functional.grid_sample(
+        descriptors, keypoints.view(b, 1, -1, 2), mode='bilinear', **args
     )
-
-  def __call__(
-      self,
-      image,
-      segmentation_mask=None,
-      num_features=1024,
-      pad_random_features=False,
-  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return self.compute(
-        image,
-        segmentation_mask=segmentation_mask,
-        num_features=num_features,
-        pad_random_features=pad_random_features,
+    descriptors = torch.nn.functional.normalize(
+        descriptors.reshape(b, c, -1), p=2, dim=1
     )
+    return descriptors
 
-  def compute(
-      self,
-      image: np.ndarray,
-      segmentation_mask: Optional[np.ndarray] = None,
-      num_features: int = 1024,
-      pad_random_features: bool = False,
-  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Feeds image through SuperPoint model to extract keypoints and features.
 
-    Args:
-      image: (H, W, 3) numpy array, decoded image bytes.
-      segmentation_mask: (H, W) binary numpy array or None. If not None,
-        extracted keypoints are restricted to being within the mask.
-      num_features: max number of features to extract (or 0 to indicate keeping
-        all extracted features).
-      pad_random_features: if True, adds randomly sampled keypoints to the
-        output such that there are exactly 'num_features' keypoints. Descriptors
-        for these sampled keypoints are taken from the network's descriptor map
-        output, and scores are set to 0. No action taken if num_features = 0.
-
-    Returns:
-      keypoints: (N, 2) numpy array, coordinates of keypoints as floats.
-      descriptors: (N, 256) numpy array, descriptors for keypoints as floats.
-      scores: (N, 1) numpy array, confidence values for keypoints as floats.
+def filter_with_mask(scores, masks, ignored_values={5, 7, 11}):
     """
-
-    # Resize image so both dimensions are divisible by 8.
-    image, keypoint_scale_factors = self._resize_input_image(image)
-    if segmentation_mask is not None:
-      segmentation_mask, _ = self._resize_input_image(
-          segmentation_mask, interpolation=cv2.INTER_NEAREST
-      )
-    assert (
-        segmentation_mask is None
-        or image.shape[:2] == segmentation_mask.shape[:2]
-    )
-
-    # Preprocess and feed-forward image.
-    image_preprocessed = self._preprocess_image(image)
-    input_image_tensor = self._graph.get_tensor_by_name('superpoint/image:0')
-    output_prob_nms_tensor = self._graph.get_tensor_by_name(
-        'superpoint/prob_nms:0'
-    )
-    output_desc_tensors = self._graph.get_tensor_by_name(
-        'superpoint/descriptors:0'
-    )
-    out = self._sess.run(
-        [output_prob_nms_tensor, output_desc_tensors],
-        feed_dict={input_image_tensor: np.expand_dims(image_preprocessed, 0)},
-    )
-
-    # Format output from network.
-    keypoint_map = np.squeeze(out[0])
-    descriptor_map = np.squeeze(out[1])
-    if segmentation_mask is not None:
-      keypoint_map = np.where(segmentation_mask, keypoint_map, 0.0)
-    keypoints, descriptors, scores = self._extract_superpoint_output(
-        keypoint_map, descriptor_map, num_features, pad_random_features
-    )
-
-    # Rescale keypoint locations to match original input image size, and return.
-    keypoints = keypoints / keypoint_scale_factors
-    return (keypoints, descriptors, scores)
-
-  def _resize_input_image(self, image, interpolation=cv2.INTER_LINEAR):
-    """Resizes image such that both dimensions are divisble by 8."""
-
-    # Calculate new image dimensions and per-dimension resizing scale factor.
-    new_dim = [-1, -1]
-    keypoint_scale_factors = [1.0, 1.0]
-    for i in range(2):
-      dim_size = image.shape[i]
-      mod_eight = dim_size % 8
-      if mod_eight < 4:
-        # Round down to nearest multiple of 8.
-        new_dim[i] = dim_size - mod_eight
-      elif mod_eight >= 4:
-        # Round up to nearest multiple of 8.
-        new_dim[i] = dim_size + (8 - mod_eight)
-      keypoint_scale_factors[i] = (new_dim[i] - 1) / (dim_size - 1)
-
-    # Resize and return image + scale factors.
-    new_dim = new_dim[::-1]  # Convert from (row, col) to (x,y).
-    keypoint_scale_factors = keypoint_scale_factors[::-1]
-    image = cv2.resize(image, tuple(new_dim), interpolation=interpolation)
-    return image, keypoint_scale_factors
-
-  def _preprocess_image(self, image):
-    """Converts image to grayscale and normalizes values for model input."""
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    image = np.expand_dims(image, 2)
-    image = image.astype(np.float32)
-    image = image / 255.0
-    return image
-
-  def _extract_superpoint_output(
-      self,
-      keypoint_map,
-      descriptor_map,
-      keep_k_points=512,
-      pad_random_features=False,
-  ):
-    """Converts from raw SuperPoint output (feature maps) into numpy arrays.
-
-    If keep_k_points is 0, then keep all detected keypoints. Otherwise, sort by
-    confidence and keep only the top k confidence keypoints.
-
-    Args:
-      keypoint_map: (H, W, 1) numpy array, raw output confidence values from
-        SuperPoint model.
-      descriptor_map: (H, W, 256) numpy array, raw output descriptors from
-        SuperPoint model.
-      keep_k_points: int, number of keypoints to keep (or 0 to indicate keeping
-        all detected keypoints).
-      pad_random_features: if True, adds randomly sampled keypoints to the
-        output such that there are exactly 'num_features' keypoints. Descriptors
-        for these sampled keypoints are taken from the network's descriptor map
-        output, and scores are set to 0. No action taken if keep_k_points = 0.
-
-    Returns:
-      keypoints: (N, 2) numpy array, image coordinates (x, y) of keypoints as
-        floats.
-      descriptors: (N, 256) numpy array, descriptors for keypoints as floats.
-      scores: (N, 1) numpy array, confidence values for keypoints as floats.
+    Zero out scores at locations where the mask value is in ignored_values.
     """
+    valid_mask = torch.ones_like(masks, dtype=torch.bool)
+    for val in ignored_values:
+        valid_mask &= (masks != val)
+    return scores * valid_mask.float()
 
-    def _select_k_best(points, k):
-      sorted_prob = points[points[:, 2].argsort(), :]
-      start = min(k, points.shape[0])
-      return sorted_prob[-start:, :2], sorted_prob[-start:, 2]
 
-    keypoints = np.where(keypoint_map > 0)
-    prob = keypoint_map[keypoints[0], keypoints[1]]
-    keypoints = np.stack([keypoints[0], keypoints[1], prob], axis=-1)
+class SuperPoint(nn.Module):
+    """SuperPoint Convolutional Detector and Descriptor
 
-    # Keep only top k points, or all points if keep_k_points param is 0.
-    if keep_k_points == 0:
-      keep_k_points = keypoints.shape[0]
-    keypoints, scores = _select_k_best(keypoints, keep_k_points)
+    SuperPoint: Self-Supervised Interest Point Detection and
+    Description. Daniel DeTone, Tomasz Malisiewicz, and Andrew
+    Rabinovich. In CVPRW, 2019. https://arxiv.org/abs/1712.07629
+    """
+    default_config = {
+        'descriptor_dim': 256,
+        'nms_radius': 4,
+        'keypoint_threshold': 0.005,
+        'max_keypoints': -1,
+        'remove_borders': 4,
+    }
 
-    # Optionally, pad with random features (and confidence scores of 0).
-    image_shape = np.array(keypoint_map.shape[:2])
-    if pad_random_features and (keep_k_points > keypoints.shape[0]):
-      num_pad = keep_k_points - keypoints.shape[0]
-      keypoints_pad = (image_shape - 1) * np.random.uniform(size=(num_pad, 2))
-      keypoints = np.concatenate((keypoints, keypoints_pad))
-      scores_pad = np.zeros((num_pad))
-      scores = np.concatenate((scores, scores_pad))
+    def __init__(self, config):
+        super().__init__()
+        self.config = {**self.default_config, **config}
 
-    # Lookup descriptors via bilinear interpolation.
-    # TODO: batch descriptor lookup with bilinear interpolation.
-    keypoints[:, [0, 1]] = keypoints[:, [1, 0]]  # Swap from (row,col) to (x,y).
-    descriptors = []
-    for kp in keypoints:
-      descriptors.append(utils.lookup_descriptor_bilinear(kp, descriptor_map))
-    descriptors = np.array(descriptors)
-    return keypoints, descriptors, scores
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
+        # Detector layers
+        self.conv1a = nn.Conv2d(1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv1b = nn.Conv2d(c1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv2a = nn.Conv2d(c1, c2, kernel_size=3, stride=1, padding=1)
+        self.conv2b = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1)
+        self.conv3a = nn.Conv2d(c2, c3, kernel_size=3, stride=1, padding=1)
+        self.conv3b = nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1)
+        self.conv4a = nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1)
+        self.conv4b = nn.Conv2d(c4, c4, kernel_size=3, stride=1, padding=1)
+
+        self.convPa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.convPb = nn.Conv2d(c5, 65, kernel_size=1, stride=1, padding=0)
+
+        # Descriptor layers
+        self.convDa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+        self.convDb = nn.Conv2d(
+            c5, self.config['descriptor_dim'],
+            kernel_size=1, stride=1, padding=0
+        )
+
+        # Load pretrained weights
+        path = (
+            "https://github.com/magicleap/"
+            "SuperGluePretrainedNetwork/raw/master/models/weights/superpoint_v1.pth"
+        )
+        state_dict = torch.hub.load_state_dict_from_url(path, map_location='cpu')
+        self.load_state_dict(state_dict)
+
+        mk = self.config['max_keypoints']
+        if mk == 0 or mk < -1:
+            raise ValueError('"max_keypoints" must be positive or "-1"')
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        masks: torch.Tensor,
+        ignored_values={0}
+    ):
+        """
+        Forward pass of the SuperPoint model with segmentation-based filtering.
+
+        Args:
+            images: (B, 1, H, W) input images.
+            masks: (B, H, W) segmentation masks (same spatial dims as images).
+            ignored_values: Set of mask values to ignore during keypoint filtering.
+
+        Returns:
+            keypoints_np: list of (N, 2) arrays with (x, y) keypoints.
+            descriptors_np: list of (N, descriptor_dim) arrays.
+            scores_np: list of (N, 1) arrays with detection scores.
+        """
+        # --- Feature Extraction ---
+        x = self.relu(self.conv1a(images))
+        x = self.relu(self.conv1b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2a(x))
+        x = self.relu(self.conv2b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3a(x))
+        x = self.relu(self.conv3b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv4a(x))
+        x = self.relu(self.conv4b(x))
+
+        # --- Keypoint Scoring ---
+        cPa = self.relu(self.convPa(x))
+        scores = self.convPb(cPa)
+        # Convert [B,65,H',W'] -> [B,H',W',65], then split off the last channel
+        scores = torch.nn.functional.softmax(scores, dim=1)[:, :-1]
+        b, _, h, w = scores.shape
+
+        # Reshape to full-resolution: (B, H', W', 8, 8) -> (B, H'*8, W'*8)
+        scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
+        scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h * 8, w * 8)
+
+        # Zero-out scores in ignored areas
+        scores = filter_with_mask(scores, masks, ignored_values=ignored_values)
+
+        # Apply non-maximum suppression
+        scores = simple_nms(scores, self.config['nms_radius'])
+
+        # --- Keypoint Extraction ---
+        net_keypoints = [torch.nonzero(s > self.config['keypoint_threshold']) for s in scores]
+        net_scores_list = [s[tuple(k.t())] for s, k in zip(scores, net_keypoints)]
+
+        kpts_filtered, scores_filtered = [], []
+        img_height, img_width = images.shape[2], images.shape[3]
+
+        for batch_index, (kpts, score_tensor) in enumerate(zip(net_keypoints, net_scores_list)):
+            # Already thresholded by net_keypoints
+            filtered_keypoints = [[j, i] for (i, j) in kpts]
+            filtered_scores = [sc.item() for sc in score_tensor]
+
+            kpts_tensor = torch.tensor(filtered_keypoints, dtype=torch.float32, device='cpu')
+            scores_tensor = torch.tensor(filtered_scores, dtype=torch.float32, device='cpu').unsqueeze(1)
+
+            # Remove keypoints close to the image borders
+            kpts_tensor, scores_tensor = remove_borders(
+                kpts_tensor, scores_tensor,
+                self.config['remove_borders'],
+                img_height, img_width
+            )
+
+            # Retain only the top-K keypoints (if configured)
+            if self.config['max_keypoints'] > 0:
+                kpts_tensor, scores_tensor = top_k_keypoints(
+                    kpts_tensor, scores_tensor, self.config['max_keypoints']
+                )
+
+            kpts_filtered.append(kpts_tensor)
+            scores_filtered.append(scores_tensor)
+
+        # --- Descriptor Extraction ---
+        descriptors_map = self.relu(self.convDa(x))
+        descriptors_map = self.convDb(descriptors_map)
+        descriptors_map = torch.nn.functional.normalize(descriptors_map, p=2, dim=1)
+
+        descriptors_sampled = []
+        for kpts, d_map in zip(kpts_filtered, descriptors_map):
+            kpts_device = kpts.to(d_map.device)
+            sampled_desc = sample_descriptors(kpts_device[None], d_map[None], s=8)[0].permute(1, 0)
+            descriptors_sampled.append(sampled_desc)
+
+        # Convert to numpy
+        keypoints_np = [k.cpu().numpy() for k in kpts_filtered]
+        descriptors_np = [d.cpu().numpy() for d in descriptors_sampled]
+        scores_np = [s.cpu().numpy() for s in scores_filtered]
+
+        return keypoints_np, descriptors_np, scores_np

@@ -1,274 +1,240 @@
-# Copyright 2024 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import os
+import time
+import logging
+from functools import wraps
+from typing import Callable, Any, List, Tuple
 
-"""Shared utility functions for OmniGlue."""
-
-import math
-from typing import Optional
 import cv2
 import numpy as np
+from PIL import Image
 import tensorflow as tf
 
+from pycolmap import TwoViewGeometryConfiguration 
 
-def lookup_descriptor_bilinear(
-    keypoint: np.ndarray, descriptor_map: np.ndarray
-) -> np.ndarray:
-  """Looks up descriptor value for keypoint from a dense descriptor map.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt='%H:%M:%S')
+logger = logging.getLogger(__name__)
 
-  Uses bilinear interpolation to find descriptor value at non-integer
-  positions.
-
-  Args:
-    keypoint: 2-dim numpy array containing (x, y) keypoint image coordinates.
-    descriptor_map: (H, W, D) numpy array representing a dense descriptor map.
-
-  Returns:
-    D-dim descriptor value at the input 'keypoint' location.
-
-  Raises:
-    ValueError, if kepoint position is out of bounds.
-  """
-  height, width = np.shape(descriptor_map)[:2]
-  if (
-      keypoint[0] < 0
-      or keypoint[0] > width
-      or keypoint[1] < 0
-      or keypoint[1] > height
-  ):
-    raise ValueError(
-        'Keypoint position (%f, %f) is out of descriptor map bounds (%i w x'
-        ' %i h).' % (keypoint[0], keypoint[1], width, height)
-    )
-
-  x_range = [math.floor(keypoint[0])]
-  if not keypoint[0].is_integer() and keypoint[0] < width-1:
-    x_range.append(x_range[0] + 1)
-  y_range = [math.floor(keypoint[1])]
-  if not keypoint[1].is_integer() and keypoint[1] < height-1:
-    y_range.append(y_range[0] + 1)
-
-  bilinear_descriptor = np.zeros(np.shape(descriptor_map)[2])
-  for curr_x in x_range:
-    for curr_y in y_range:
-      curr_descriptor = descriptor_map[curr_y, curr_x, :]
-      bilinear_scalar = (1.0 - abs(keypoint[0] - curr_x)) * (
-          1.0 - abs(keypoint[1] - curr_y)
-      )
-      bilinear_descriptor += bilinear_scalar * curr_descriptor
-  return bilinear_descriptor
-
+def timed(func: Callable) -> Callable:
+    """
+    A decorator that logs the execution time of the function.
+    """
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed_time = time.perf_counter() - start_time
+        logger.info(f"{func.__name__} executed in {elapsed_time:.4f} seconds")
+        return result
+    return wrapper
 
 def soft_assignment_to_match_matrix(
     soft_assignment: tf.Tensor, match_threshold: float
 ) -> tf.Tensor:
-  """Converts a matrix of soft assignment values to binary yes/no match matrix.
+    """
+    Converts a matrix of soft assignment values to a binary yes/no match matrix
+    using mutual nearest neighbor checks and thresholding.
 
-  Searches soft_assignment for row- and column-maximum values, which indicate
-  mutual nearest neighbor matches between two unique sets of keypoints. Also,
-  ensures that score values for matches are above the specified threshold.
+    :param soft_assignment: (B, N, M) tensor. Matching likelihood between sets
+      of features (N in image0, M in image1).
+    :param match_threshold: float, threshold to consider a match valid.
+    :return: A boolean tensor of shape (B, N, M). A `True` indicates a match.
+    """
+    max0 = tf.reduce_max(soft_assignment, axis=2)   
+    indices0 = tf.argmax(soft_assignment, axis=2)   
+    indices1 = tf.argmax(soft_assignment, axis=1)  
 
-  Args:
-    soft_assignment: (B, N, M) tensor, contains matching likelihood value
-      between features of different sets. N is number of features in image0, and
-      M is number of features in image1. Higher value indicates more likely to
-      match.
-    match_threshold: float, thresholding value to consider a match valid.
+    B = tf.shape(soft_assignment)[0]
+    N = tf.shape(soft_assignment)[1]
+    M = tf.shape(soft_assignment)[2]
 
-  Returns:
-    (B, N, M) tensor of binary values. A value of 1 at index (x, y) indicates
-    a match between index 'x' (out of N) in image0 and index 'y' (out of M) in
-    image 1.
-  """
+    row_idx = tf.tile(tf.expand_dims(tf.range(N, dtype=indices1.dtype), 0), [B, 1]) 
+    col_idx = indices0  
+    row_gathered = tf.gather(indices1, col_idx, batch_dims=1)  
+    mutual = tf.equal(row_gathered, row_idx)  
 
-  def _range_like(x, dim):
-    """Returns tensor with values (0, 1, 2, ..., N) for dimension in input x."""
-    return tf.range(tf.shape(x)[dim], dtype=x.dtype)
+    match_mask = tf.cast(mutual, soft_assignment.dtype)     
+    match_scores = match_mask * max0   
 
-  # TODO(omniglue): batch loop & SparseTensor are slow. Optimize with tf ops.
-  matches = tf.TensorArray(tf.float32, size=tf.shape(soft_assignment)[0])
-  for i in range(tf.shape(soft_assignment)[0]):
-    # Iterate through batch and process one example at a time.
-    scores = tf.expand_dims(soft_assignment[i, :], 0)  # Shape: (1, N, M).
+    oh = tf.one_hot(col_idx, depth=M, dtype=soft_assignment.dtype)   
+    match_scores_expanded = tf.expand_dims(match_scores, axis=-1)   
+    match_matrix_f = oh * match_scores_expanded                     
+    match_matrix = match_matrix_f > match_threshold
+    return match_matrix
 
-    # Find indices for max values per row and per column.
-    max0 = tf.math.reduce_max(scores, axis=2)  # Shape: (1, N).
-    indices0 = tf.math.argmax(scores, axis=2)  # Shape: (1, N).
-    indices1 = tf.math.argmax(scores, axis=1)  # Shape: (1, M).
+def normalize_descriptors(desc: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(desc, axis=1, keepdims=True)
+    norm[norm == 0] = 1e-8
+    return desc / norm
 
-    # Find matches from mutual argmax indices of each set of keypoints.
-    mutual = tf.expand_dims(_range_like(indices0, 1), 0) == tf.gather(
-        indices1, indices0, axis=1
-    )
+def brute_force(desc0: np.ndarray, desc1: np.ndarray, ratio: float = 0.75) -> np.ndarray:
+    """
+    Standard brute-force matching for fallback if the deep matching yields too few matches.
+    """
+    desc0_norm = normalize_descriptors(desc0)
+    desc1_norm = normalize_descriptors(desc1)
 
-    # Create match matrix from sets of index pairs and values.
-    kp_ind_pairs = tf.stack(
-        [_range_like(indices0, 1), tf.squeeze(indices0)], axis=1
-    )
-    mutual_max0 = tf.squeeze(tf.squeeze(tf.where(mutual, max0, 0), 0))
-    sparse = tf.sparse.SparseTensor(
-        kp_ind_pairs, mutual_max0, tf.shape(scores, out_type=tf.int64)[1:]
-    )
-    match_matrix = tf.sparse.to_dense(sparse)
-    matches = matches.write(i, match_matrix)
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+    knn_matches = bf.knnMatch(desc0_norm, desc1_norm, k=2)
 
-  # Threshold on match_threshold value and convert to binary (0, 1) values.
-  match_matrix = matches.stack()
-  match_matrix = match_matrix > match_threshold
-  return match_matrix
+    good_matches = []
+    for m, n in knn_matches:
+        if m.distance < ratio * n.distance:
+            good_matches.append([m.queryIdx, m.trainIdx])
+    return np.array(good_matches, dtype=np.int32)
 
+def construct_camera_intrinsics(camera_params: List[float]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Constructs the camera intrinsic matrix K and distortion coefficients D 
+    from the provided camera parameters: fx, fy, cx, cy, k1, k2, p1, p2.
+    """
+    fx, fy, cx, cy, k1, k2, p1, p2 = camera_params
+    K = np.array([
+        [fx,  0, cx],
+        [0, fy, cy],
+        [0,  0,  1]
+    ], dtype=np.float64)
 
-def visualize_matches(
-    image0: np.ndarray,
-    image1: np.ndarray,
-    kp0: np.ndarray,
-    kp1: np.ndarray,
-    match_matrix: np.ndarray,
-    match_labels: Optional[np.ndarray] = None,
-    show_keypoints: bool = False,
-    highlight_unmatched: bool = False,
-    title: Optional[str] = None,
-    line_width: int = 1,
-    circle_radius: int = 4,
-    circle_thickness: int = 2,
-    rng: Optional['np.random.Generator'] = None,
-):
-  """Generates visualization of keypoints and matches for two images.
+    D = np.array([k1, k2, p1, p2], dtype=np.float64)
+    return K, D
 
-  Stacks image0 and image1 horizontally. In case the two images have different
-  heights, scales image1 (and its keypoints) to match image0's height. Note
-  that keypoints must be in (x, y) format, NOT (row, col). If match_matrix
-  includes unmatched dustbins, the dustbins will be removed before visualizing
-  matches.
-
-  Args:
-    image0: (H, W, 3) array containing image0 contents.
-    image1: (H, W, 3) array containing image1 contents.
-    kp0: (N, 2) array where each row represents (x, y) coordinates of keypoints
-      in image0.
-    kp1: (M, 2) array, where each row represents (x, y) coordinates of keypoints
-      in image1.
-    match_matrix: (N, M) binary array, where values are non-zero for keypoint
-      indices making up a match.
-    match_labels: (N, M) binary array, where values are non-zero for keypoint
-      indices making up a ground-truth match. When None, matches from
-      'match_matrix' are colored randomly. Otherwise, matches from
-      'match_matrix' are colored according to accuracy (compared to labels).
-    show_keypoints: if True, all image0 and image1 keypoints (including
-      unmatched ones) are visualized.
-    highlight_unmatched: if True, highlights unmatched keypoints in blue.
-    title: if not None, adds title text to top left of visualization.
-    line_width: width of correspondence line, in pixels.
-    circle_radius: radius of keypoint circles, if visualized.
-    circle_thickness: thickness of keypoint circles, if visualized.
-    rng: np random number generator to generate the line colors.
-
-  Returns:
-    Numpy array of image0 and image1 side-by-side, with lines between matches
-    according to match_matrix. If show_keypoints is True, keypoints from both
-    images are also visualized.
-  """
-  # initialize RNG
-  if rng is None:
-    rng = np.random.default_rng()
-
-  # Make copy of input param that may be modified in this function.
-  kp1 = np.copy(kp1)
-
-  # Detect unmatched dustbins.
-  has_unmatched_dustbins = (match_matrix.shape[0] == kp0.shape[0] + 1) and (
-      match_matrix.shape[1] == kp1.shape[0] + 1
-  )
-
-  # If necessary, resize image1 so that the pair can be stacked horizontally.
-  height0 = image0.shape[0]
-  height1 = image1.shape[0]
-  if height0 != height1:
-    scale_factor = height0 / height1
-    if scale_factor <= 1.0:
-      interp_method = cv2.INTER_AREA
+def rotm_to_quaternion(R: np.ndarray) -> np.ndarray:
+    """
+    Converts a 3x3 rotation matrix to a quaternion [w, x, y, z].
+    """
+    q = np.empty(4, dtype=np.float64)
+    t = np.trace(R)
+    if t > 0.0:
+        t = np.sqrt(1.0 + t)
+        q[0] = 0.5 * t
+        t = 0.5 / t
+        q[1] = (R[2, 1] - R[1, 2]) * t
+        q[2] = (R[0, 2] - R[2, 0]) * t
+        q[3] = (R[1, 0] - R[0, 1]) * t
     else:
-      interp_method = cv2.INTER_LINEAR
-    new_dim1 = (int(image1.shape[1] * scale_factor), height0)
-    image1 = cv2.resize(image1, new_dim1, interpolation=interp_method)
-    kp1 *= scale_factor
+        i = 0 if R[1, 1] <= R[0, 0] else 1
+        if R[2, 2] > R[i, i]:
+            i = 2
+        j, k = (i + 1) % 3, (i + 2) % 3
+        t = np.sqrt(R[i, i] - R[j, j] - R[k, k] + 1.0)
+        q[i + 1] = 0.5 * t
+        t = 0.5 / t
+        q[0] = (R[k, j] - R[j, k]) * t
+        q[j + 1] = (R[j, i] + R[i, j]) * t
+        q[k + 1] = (R[k, i] + R[i, k]) * t
+    return q
 
-  # Create side-by-side image and add lines for all matches.
-  viz = cv2.hconcat([image0, image1])
-  w0 = image0.shape[1]
-  matches = np.argwhere(
-      match_matrix[:-1, :-1] if has_unmatched_dustbins else match_matrix
-  )
-  for match in matches:
-    pt0 = (int(kp0[match[0], 0]), int(kp0[match[0], 1]))
-    pt1 = (int(kp1[match[1], 0] + w0), int(kp1[match[1], 1]))
-    if match_labels is None:
-      color = tuple(rng.integers(0, 255, size=3).tolist())
-    else:
-      if match_labels[match[0], match[1]]:
+def compute_two_view_geometry(
+    pts1: np.ndarray, 
+    pts2: np.ndarray, 
+    K: np.ndarray, 
+    D: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Computes the Fundamental (F), Essential (E), Homography (H), 
+    and the relative pose (q, t) between two sets of matched points 
+    (pts1, pts2).
+    """
+    N1 = cv2.fisheye.undistortPoints(pts1, K, D)
+    N2 = cv2.fisheye.undistortPoints(pts2, K, D)
+
+    enough_matches = (N1 is not None and N2 is not None and len(N1) >= 4 and len(N2) >= 4)
+
+    if not enough_matches:
+        logger.info("[WARNING] Not enough matches => returning identity geometry.")
+        return (
+            np.eye(3),  
+            np.eye(3),  
+            np.eye(3), 
+            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),  
+            np.zeros((3, 1), dtype=np.float64)  
+        )
+
+    F, _ = cv2.findFundamentalMat(N1, N2, cv2.FM_RANSAC)
+    if F is None:
+        F = np.eye(3)
+
+    E, _ = cv2.findEssentialMat(N1, N2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+    if E is None:
+        E = np.eye(3)
+
+    ret, R, tvec, _ = cv2.recoverPose(E, N1, N2, K)
+    if not ret:
+        R = np.eye(3)
+        tvec = np.zeros((3,1))
+
+    H, _ = cv2.findHomography(N1, N2, cv2.RANSAC)
+    if H is None:
+        H = np.eye(3)
+
+    qvec = rotm_to_quaternion(R)
+    return F, E, H, qvec, tvec
+
+def determine_geometry_config(F: np.ndarray, E: np.ndarray, H: np.ndarray) -> TwoViewGeometryConfiguration:
+    """
+    Determines the appropriate TwoViewGeometryConfiguration based on 
+    the estimated F, E, H matrices using rank checks and non-zero checks.
+    """
+    EPS = 1e-6
+
+    if E is not None and not np.allclose(E, 0, atol=EPS):
+        rank_E = np.linalg.matrix_rank(E)
+        if rank_E == 2:
+            return TwoViewGeometryConfiguration.CALIBRATED
+        else:
+            return TwoViewGeometryConfiguration.DEGENERATE
+
+    if F is not None and not np.allclose(F, 0, atol=EPS):
+        rank_F = np.linalg.matrix_rank(F)
+        if rank_F == 2:
+            return TwoViewGeometryConfiguration.UNCALIBRATED
+        else:
+            return TwoViewGeometryConfiguration.DEGENERATE
+
+    if H is not None and not np.allclose(H, 0, atol=EPS):
+        return TwoViewGeometryConfiguration.PLANAR_OR_PANORAMIC
+
+    return TwoViewGeometryConfiguration.UNDEFINED
+
+def get_index_by_id(colmap_db, image_id: int, image_paths: List[str]):
+    """
+    Returns the index in `image_paths` that corresponds to the given `image_id`.
+    """
+    name = colmap_db.get_image_name(image_id)
+    for idx, path in enumerate(image_paths):
+        if os.path.basename(path) == name:
+            return idx
+    return None
+
+def visualize_matches(ref_img_path: str, succ_img_path: str, pts1: np.ndarray, pts2: np.ndarray, output_dir: str = "viz"):
+    """
+    Visualize feature matches.
+    """
+    ref = np.array(Image.open(ref_img_path).convert("RGB"))
+    succ = np.array(Image.open(succ_img_path).convert("RGB"))
+
+    viz = np.hstack((ref, succ))
+    w0 = ref.shape[1]
+
+    # Draw lines between matching keypoints
+    for pt1, pt2 in zip(pts1, pts2):
+        pt1 = tuple(np.array(pt1).flatten().astype(np.int32))
+        pt2 = tuple((np.array(pt2).flatten() + np.array([w0, 0])).astype(np.int32))
         color = (0, 255, 0)
-      else:
-        color = (255, 0, 0)
-    cv2.line(viz, pt0, pt1, color, line_width)
+        cv2.line(viz, pt1, pt2, color, 2)
 
-  # Optionally, add circles to output image to represent each keypoint.
-  if show_keypoints:
-    for i in range(np.shape(kp0)[0]):
-      kp = kp0[i, :]
-      if highlight_unmatched and has_unmatched_dustbins and match_matrix[i, -1]:
-        cv2.circle(
-            viz,
-            tuple(kp.astype(np.int32).tolist()),
-            circle_radius,
-            (255, 0, 0),
-            circle_thickness,
-        )
-      else:
-        cv2.circle(
-            viz,
-            tuple(kp.astype(np.int32).tolist()),
-            circle_radius,
-            (0, 0, 255),
-            circle_thickness,
-        )
-    for j in range(np.shape(kp1)[0]):
-      kp = kp1[j, :]
-      kp[0] += w0
-      if highlight_unmatched and has_unmatched_dustbins and match_matrix[-1, j]:
-        cv2.circle(
-            viz,
-            tuple(kp.astype(np.int32).tolist()),
-            circle_radius,
-            (255, 0, 0),
-            circle_thickness,
-        )
-      else:
-        cv2.circle(
-            viz,
-            tuple(kp.astype(np.int32).tolist()),
-            circle_radius,
-            (0, 0, 255),
-            circle_thickness,
-        )
-  if title is not None:
-    viz = cv2.putText(
-        viz,
-        title,
-        (5, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 0, 255),
-        2,
-        cv2.LINE_AA,
-    )
-  return viz
+    # Draw circles on keypoints from the reference image
+    for kp in pts1:
+        kp_tuple = tuple(np.array(kp).flatten().astype(np.int32))
+        cv2.circle(viz, kp_tuple, 4, (0, 0, 255), 2)
+
+    # Draw circles on keypoints from the successor image
+    for kp in pts2:
+        kp = np.array(kp).flatten()
+        kp[0] += w0  
+        kp_tuple = tuple(kp.astype(np.int32))
+        cv2.circle(viz, kp_tuple, 4, (0, 0, 255), 2)
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_name = f"{os.path.basename(ref_img_path)}_{os.path.basename(succ_img_path)}.png"
+    out_path = os.path.join(output_dir, out_name)
+    cv2.imwrite(out_path, viz)
